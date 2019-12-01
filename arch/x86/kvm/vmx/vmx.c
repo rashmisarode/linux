@@ -70,6 +70,9 @@ extern u64 net_exit_time;
 extern atomic_t exit_count;
 extern atomic_t exit_reason_arr[70];
 
+extern atomic_long_t total_exit_time; 
+extern atomic_long_t exit_time[70];
+
 MODULE_AUTHOR("Qumranet");
 MODULE_LICENSE("GPL");
 
@@ -4605,16 +4608,28 @@ static void kvm_machine_check(void)
 	mutex_unlock(&mutex_count);
 }*/
 
+static void atomic_exit_time_cal(int index, u64 begin_cycle) {
+	u64 end_cycle = rdtsc();
+	u64 total_cycles = atomic_long_read(&exit_time[index]);
+	total_cycles = total_cycles + (end_cycle - begin_cycle);
+	atomic_long_set(&exit_time[index], total_cycles);
+}
+
 static int handle_machine_check(struct kvm_vcpu *vcpu)
 {
+
+	u64 begin_cycle = rdtsc();
         /*atomic_increment_exit_reason(41);*/
 	atomic_inc(&exit_reason_arr[41]);
 	/* handled by vmx_vcpu_run() */
+	atomic_exit_time_cal(41, begin_cycle);
 	return 1;
 }
 
 static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	struct kvm_run *kvm_run = vcpu->run;
 	u32 intr_info, ex_no, error_code;
@@ -4628,10 +4643,17 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 	intr_info = vmx->exit_intr_info;
 
 	if (is_machine_check(intr_info) || is_nmi(intr_info))
+	{
+		atomic_exit_time_cal(0, begin_cycle);
 		return 1; /* handled by handle_exception_nmi_irqoff() */
+	}
 
 	if (is_invalid_opcode(intr_info))
-		return handle_ud(vcpu);
+	{
+		return_value = handle_ud(vcpu);
+		atomic_exit_time_cal(0, begin_cycle);
+		return return_value;
+	}
 
 	error_code = 0;
 	if (intr_info & INTR_INFO_DELIVER_CODE_MASK)
@@ -4647,9 +4669,12 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 		 */
 		if (error_code) {
 			kvm_queue_exception_e(vcpu, GP_VECTOR, error_code);
+			atomic_exit_time_cal(0, begin_cycle);
 			return 1;
 		}
-		return kvm_emulate_instruction(vcpu, EMULTYPE_VMWARE_GP);
+		return_value = kvm_emulate_instruction(vcpu, EMULTYPE_VMWARE_GP);
+		atomic_exit_time_cal(0, begin_cycle);
+		return return_value;
 	}
 
 	/*
@@ -4665,6 +4690,7 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 		vcpu->run->internal.data[0] = vect_info;
 		vcpu->run->internal.data[1] = intr_info;
 		vcpu->run->internal.data[2] = error_code;
+		atomic_exit_time_cal(0, begin_cycle);
 		return 0;
 	}
 
@@ -4672,17 +4698,23 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 		cr2 = vmcs_readl(EXIT_QUALIFICATION);
 		/* EPT won't cause page fault directly */
 		WARN_ON_ONCE(!vcpu->arch.apf.host_apf_reason && enable_ept);
-		return kvm_handle_page_fault(vcpu, error_code, cr2, NULL, 0);
+		return_value = kvm_handle_page_fault(vcpu, error_code, cr2, NULL, 0);
+		atomic_exit_time_cal(0, begin_cycle);
+		return return_value;
 	}
 
 	ex_no = intr_info & INTR_INFO_VECTOR_MASK;
 
-	if (vmx->rmode.vm86_active && rmode_exception(vcpu, ex_no))
-		return handle_rmode_exception(vcpu, ex_no, error_code);
+	if (vmx->rmode.vm86_active && rmode_exception(vcpu, ex_no)) {
+		return_value = handle_rmode_exception(vcpu, ex_no, error_code);
+		atomic_exit_time_cal(0, begin_cycle);
+		return return_value;
+	}
 
 	switch (ex_no) {
 	case AC_VECTOR:
 		kvm_queue_exception_e(vcpu, AC_VECTOR, error_code);
+		atomic_exit_time_cal(0, begin_cycle);
 		return 1;
 	case DB_VECTOR:
 		dr6 = vmcs_readl(EXIT_QUALIFICATION);
@@ -4694,6 +4726,7 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 				WARN_ON(!skip_emulated_instruction(vcpu));
 
 			kvm_queue_exception(vcpu, DB_VECTOR);
+			atomic_exit_time_cal(0, begin_cycle);
 			return 1;
 		}
 		kvm_run->debug.arch.dr6 = dr6 | DR6_FIXED_1;
@@ -4718,28 +4751,35 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 		kvm_run->ex.error_code = error_code;
 		break;
 	}
+	atomic_exit_time_cal(0, begin_cycle);
 	return 0;
 }
 
 static int handle_external_interrupt(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
        /* atomic_increment_exit_reason(1);*/
 	atomic_inc(&exit_reason_arr[1]);
 	++vcpu->stat.irq_exits;
+	atomic_exit_time_cal(1, begin_cycle);
 	return 1;
 }
 
 static int handle_triple_fault(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
        /* atomic_increment_exit_reason(2);*/
 	atomic_inc(&exit_reason_arr[2]);
 	vcpu->run->exit_reason = KVM_EXIT_SHUTDOWN;
 	vcpu->mmio_needed = 0;
+	atomic_exit_time_cal(2, begin_cycle);
 	return 0;
 }
 
 static int handle_io(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	unsigned long exit_qualification;
 	int size, in, string;
 	unsigned port;
@@ -4750,14 +4790,19 @@ static int handle_io(struct kvm_vcpu *vcpu)
 
 	++vcpu->stat.io_exits;
 
-	if (string)
-		return kvm_emulate_instruction(vcpu, 0);
+	if (string) {
+		return_value = kvm_emulate_instruction(vcpu, 0);
+		atomic_exit_time_cal(30, begin_cycle);
+		return return_value;
+	}
 
 	port = exit_qualification >> 16;
 	size = (exit_qualification & 7) + 1;
 	in = (exit_qualification & 8) != 0;
 
-	return kvm_fast_pio(vcpu, size, port, in);
+	return_value = kvm_fast_pio(vcpu, size, port, in);
+	atomic_exit_time_cal(30, begin_cycle);
+	return return_value;
 }
 
 static void
@@ -4824,12 +4869,29 @@ static int handle_set_cr4(struct kvm_vcpu *vcpu, unsigned long val)
 
 static int handle_desc(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	u32 exit_reason = vmx->exit_reason;
 	WARN_ON(!(vcpu->arch.cr4 & X86_CR4_UMIP));
+	if(exit_reason == EXIT_REASON_GDTR_IDTR) {
+		return_value = kvm_emulate_instruction(vcpu, 0);
+		atomic_exit_time_cal(46, begin_cycle);
+		return return_value;	
+	}
+	else if(exit_reason == EXIT_REASON_LDTR_TR)
+	{
+		return_value = kvm_emulate_instruction(vcpu, 0);
+		atomic_exit_time_cal(47, begin_cycle);
+		return return_value;
+	}
 	return kvm_emulate_instruction(vcpu, 0);
 }
 
 static int handle_cr(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	unsigned long exit_qualification, val;
 	int cr;
 	int reg;
@@ -4848,29 +4910,40 @@ static int handle_cr(struct kvm_vcpu *vcpu)
 		switch (cr) {
 		case 0:
 			err = handle_set_cr0(vcpu, val);
-			return kvm_complete_insn_gp(vcpu, err);
+			return_value = kvm_complete_insn_gp(vcpu, err);
+			atomic_exit_time_cal(28, begin_cycle);
+			return return_value;
 		case 3:
 			WARN_ON_ONCE(enable_unrestricted_guest);
 			err = kvm_set_cr3(vcpu, val);
-			return kvm_complete_insn_gp(vcpu, err);
+			return_value = kvm_complete_insn_gp(vcpu, err);
+			atomic_exit_time_cal(28, begin_cycle);
+			return return_value;
 		case 4:
 			err = handle_set_cr4(vcpu, val);
-			return kvm_complete_insn_gp(vcpu, err);
+			return_value = kvm_complete_insn_gp(vcpu, err);
+			atomic_exit_time_cal(28, begin_cycle);
+			return return_value;
 		case 8: {
 				u8 cr8_prev = kvm_get_cr8(vcpu);
 				u8 cr8 = (u8)val;
 				err = kvm_set_cr8(vcpu, cr8);
 				ret = kvm_complete_insn_gp(vcpu, err);
-				if (lapic_in_kernel(vcpu))
+				if (lapic_in_kernel(vcpu)) {
+					atomic_exit_time_cal(28, begin_cycle);
 					return ret;
-				if (cr8_prev <= cr8)
+				}
+				if (cr8_prev <= cr8) {
+					atomic_exit_time_cal(28, begin_cycle);
 					return ret;
+				}
 				/*
 				 * TODO: we might be squashing a
 				 * KVM_GUESTDBG_SINGLESTEP-triggered
 				 * KVM_EXIT_DEBUG here.
 				 */
 				vcpu->run->exit_reason = KVM_EXIT_SET_TPR;
+				atomic_exit_time_cal(28, begin_cycle);
 				return 0;
 			}
 		}
@@ -4879,7 +4952,9 @@ static int handle_cr(struct kvm_vcpu *vcpu)
 		WARN_ONCE(1, "Guest should always own CR0.TS");
 		vmx_set_cr0(vcpu, kvm_read_cr0_bits(vcpu, ~X86_CR0_TS));
 		trace_kvm_cr_write(0, kvm_read_cr0(vcpu));
-		return kvm_skip_emulated_instruction(vcpu);
+		return_value = kvm_skip_emulated_instruction(vcpu);
+		atomic_exit_time_cal(28, begin_cycle);
+		return return_value;
 	case 1: /*mov from cr*/
 		switch (cr) {
 		case 3:
@@ -4887,12 +4962,16 @@ static int handle_cr(struct kvm_vcpu *vcpu)
 			val = kvm_read_cr3(vcpu);
 			kvm_register_write(vcpu, reg, val);
 			trace_kvm_cr_read(cr, val);
-			return kvm_skip_emulated_instruction(vcpu);
+			return_value = kvm_skip_emulated_instruction(vcpu);
+			atomic_exit_time_cal(28, begin_cycle);
+			return return_value;
 		case 8:
 			val = kvm_get_cr8(vcpu);
 			kvm_register_write(vcpu, reg, val);
 			trace_kvm_cr_read(cr, val);
-			return kvm_skip_emulated_instruction(vcpu);
+			return_value = kvm_skip_emulated_instruction(vcpu);
+			atomic_exit_time_cal(28, begin_cycle);
+			return return_value;
 		}
 		break;
 	case 3: /* lmsw */
@@ -4900,18 +4979,23 @@ static int handle_cr(struct kvm_vcpu *vcpu)
 		trace_kvm_cr_write(0, (kvm_read_cr0(vcpu) & ~0xful) | val);
 		kvm_lmsw(vcpu, val);
 
-		return kvm_skip_emulated_instruction(vcpu);
+		return_value = kvm_skip_emulated_instruction(vcpu);
+		atomic_exit_time_cal(28, begin_cycle);
+		return return_value;
 	default:
 		break;
 	}
 	vcpu->run->exit_reason = 0;
 	vcpu_unimpl(vcpu, "unhandled control register: op %d cr %d\n",
 	       (int)(exit_qualification >> 4) & 3, cr);
+	atomic_exit_time_cal(28, begin_cycle);
 	return 0;
 }
 
 static int handle_dr(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	unsigned long exit_qualification;
 	int dr, dr7, reg;
 	/*atomic_increment_exit_reason(29);*/
@@ -4920,12 +5004,16 @@ static int handle_dr(struct kvm_vcpu *vcpu)
 	dr = exit_qualification & DEBUG_REG_ACCESS_NUM;
 
 	/* First, if DR does not exist, trigger UD */
-	if (!kvm_require_dr(vcpu, dr))
+	if (!kvm_require_dr(vcpu, dr)) {
+		atomic_exit_time_cal(29, begin_cycle);
 		return 1;
+	}
 
 	/* Do not handle if the CPL > 0, will trigger GP on re-entry */
-	if (!kvm_require_cpl(vcpu, 0))
+	if (!kvm_require_cpl(vcpu, 0)) {
+		atomic_exit_time_cal(29, begin_cycle);
 		return 1;
+	}
 	dr7 = vmcs_readl(GUEST_DR7);
 	if (dr7 & DR7_GD) {
 		/*
@@ -4939,11 +5027,13 @@ static int handle_dr(struct kvm_vcpu *vcpu)
 			vcpu->run->debug.arch.pc = kvm_get_linear_rip(vcpu);
 			vcpu->run->debug.arch.exception = DB_VECTOR;
 			vcpu->run->exit_reason = KVM_EXIT_DEBUG;
+			atomic_exit_time_cal(29, begin_cycle);
 			return 0;
 		} else {
 			vcpu->arch.dr6 &= ~DR_TRAP_BITS;
 			vcpu->arch.dr6 |= DR6_BD | DR6_RTM;
 			kvm_queue_exception(vcpu, DB_VECTOR);
+			atomic_exit_time_cal(29, begin_cycle);
 			return 1;
 		}
 	}
@@ -4957,6 +5047,7 @@ static int handle_dr(struct kvm_vcpu *vcpu)
 		 * retrieve the full state of the debug registers.
 		 */
 		vcpu->arch.switch_db_regs |= KVM_DEBUGREG_WONT_EXIT;
+		atomic_exit_time_cal(29, begin_cycle);
 		return 1;
 	}
 
@@ -4964,14 +5055,20 @@ static int handle_dr(struct kvm_vcpu *vcpu)
 	if (exit_qualification & TYPE_MOV_FROM_DR) {
 		unsigned long val;
 
-		if (kvm_get_dr(vcpu, dr, &val))
+		if (kvm_get_dr(vcpu, dr, &val)) {
+			atomic_exit_time_cal(29, begin_cycle);
 			return 1;
+		}
 		kvm_register_write(vcpu, reg, val);
 	} else
-		if (kvm_set_dr(vcpu, dr, kvm_register_readl(vcpu, reg)))
+		if (kvm_set_dr(vcpu, dr, kvm_register_readl(vcpu, reg))) {
+			atomic_exit_time_cal(29, begin_cycle);
 			return 1;
+		}
 
-	return kvm_skip_emulated_instruction(vcpu);
+	return_value = kvm_skip_emulated_instruction(vcpu);
+	atomic_exit_time_cal(29, begin_cycle);
+	return return_value;
 }
 
 static u64 vmx_get_dr6(struct kvm_vcpu *vcpu)
@@ -5003,35 +5100,52 @@ static void vmx_set_dr7(struct kvm_vcpu *vcpu, unsigned long val)
 
 static int handle_cpuid(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(10);*/
 	atomic_inc(&exit_reason_arr[10]);
-	return kvm_emulate_cpuid(vcpu);
+	return_value = kvm_emulate_cpuid(vcpu);
+	atomic_exit_time_cal(10, begin_cycle);
+	return return_value;
 }
 
 static int handle_rdmsr(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(31);*/
 	atomic_inc(&exit_reason_arr[31]);
-	return kvm_emulate_rdmsr(vcpu);
+	return_value = kvm_emulate_rdmsr(vcpu);
+	atomic_exit_time_cal(31, begin_cycle);
+	return return_value;
 }
 
 static int handle_wrmsr(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(32);*/
 	atomic_inc(&exit_reason_arr[32]);
-	return kvm_emulate_wrmsr(vcpu);
+	return_value = kvm_emulate_wrmsr(vcpu);
+	atomic_exit_time_cal(32, begin_cycle);
+	return return_value;
 }
 
 static int handle_tpr_below_threshold(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
        /* atomic_increment_exit_reason(43);*/
 	atomic_inc(&exit_reason_arr[43]);
 	kvm_apic_update_ppr(vcpu);
+	atomic_exit_time_cal(43, begin_cycle);
 	return 1;
 }
 
 static int handle_interrupt_window(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(7);*/
 	atomic_inc(&exit_reason_arr[7]);
 	exec_controls_clearbit(to_vmx(vcpu), CPU_BASED_VIRTUAL_INTR_PENDING);
@@ -5039,69 +5153,102 @@ static int handle_interrupt_window(struct kvm_vcpu *vcpu)
 	kvm_make_request(KVM_REQ_EVENT, vcpu);
 
 	++vcpu->stat.irq_window_exits;
+	atomic_exit_time_cal(7, begin_cycle);
 	return 1;
 }
 
 static int handle_halt(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(12);*/
 	atomic_inc(&exit_reason_arr[12]);
-	return kvm_emulate_halt(vcpu);
+	return_value = kvm_emulate_halt(vcpu);
+	atomic_exit_time_cal(12, begin_cycle);
+	return return_value;
 }
 
 static int handle_vmcall(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
        /* atomic_increment_exit_reason(18);*/
 	atomic_inc(&exit_reason_arr[18]);
-	return kvm_emulate_hypercall(vcpu);
+	return_value = kvm_emulate_hypercall(vcpu);
+	atomic_exit_time_cal(18, begin_cycle);
+	return return_value;
 }
 
 static int handle_invd(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(13);*/
 	atomic_inc(&exit_reason_arr[13]);
-	return kvm_emulate_instruction(vcpu, 0);
+	return_value = kvm_emulate_instruction(vcpu, 0);
+	atomic_exit_time_cal(13, begin_cycle);
+	return return_value;
 }
 
 static int handle_invlpg(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	
 	unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
        /* atomic_increment_exit_reason(14);*/
 	atomic_inc(&exit_reason_arr[14]);
 	kvm_mmu_invlpg(vcpu, exit_qualification);
-	return kvm_skip_emulated_instruction(vcpu);
+	return_value = kvm_skip_emulated_instruction(vcpu);
+	atomic_exit_time_cal(14, begin_cycle);
+	return return_value;
 }
 
 static int handle_rdpmc(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	int err;
        /* atomic_increment_exit_reason(15);*/
 	atomic_inc(&exit_reason_arr[15]);
 	err = kvm_rdpmc(vcpu);
-	return kvm_complete_insn_gp(vcpu, err);
+	return_value = kvm_complete_insn_gp(vcpu, err);
+	atomic_exit_time_cal(15, begin_cycle);
+	return return_value;
 }
 
 static int handle_wbinvd(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(54);*/
 	atomic_inc(&exit_reason_arr[54]);
-	return kvm_emulate_wbinvd(vcpu);
+	return_value = kvm_emulate_wbinvd(vcpu);
+	atomic_exit_time_cal(54, begin_cycle);
+	return return_value;
 }
 
 static int handle_xsetbv(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	u64 new_bv = kvm_read_edx_eax(vcpu);
 	u32 index = kvm_rcx_read(vcpu);
        /* atomic_increment_exit_reason(55);*/
 	atomic_inc(&exit_reason_arr[55]);
-	if (kvm_set_xcr(vcpu, index, new_bv) == 0)
-		return kvm_skip_emulated_instruction(vcpu);
+	if (kvm_set_xcr(vcpu, index, new_bv) == 0) {
+		return_value = kvm_skip_emulated_instruction(vcpu);
+		atomic_exit_time_cal(55, begin_cycle);
+		return return_value;
+	}
+	atomic_exit_time_cal(55, begin_cycle);
 	return 1;
 }
 
 static int handle_apic_access(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(44);*/
 	atomic_inc(&exit_reason_arr[44]);
 	if (likely(fasteoi)) {
@@ -5118,36 +5265,48 @@ static int handle_apic_access(struct kvm_vcpu *vcpu)
 		if ((access_type == TYPE_LINEAR_APIC_INST_WRITE) &&
 		    (offset == APIC_EOI)) {
 			kvm_lapic_set_eoi(vcpu);
-			return kvm_skip_emulated_instruction(vcpu);
+			return_value = kvm_skip_emulated_instruction(vcpu);
+			atomic_exit_time_cal(44, begin_cycle);
+			return return_value;
 		}
 	}
-	return kvm_emulate_instruction(vcpu, 0);
+	return_value = kvm_emulate_instruction(vcpu, 0);
+	atomic_exit_time_cal(44, begin_cycle);
+	return return_value;
 }
 
 static int handle_apic_eoi_induced(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
 	int vector = exit_qualification & 0xff;
         /*atomic_increment_exit_reason(45);*/
 	atomic_inc(&exit_reason_arr[45]);
 	/* EOI-induced VM exit is trap-like and thus no need to adjust IP */
 	kvm_apic_set_eoi_accelerated(vcpu, vector);
+	atomic_exit_time_cal(45, begin_cycle);
 	return 1;
 }
 
 static int handle_apic_write(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
 	u32 offset = exit_qualification & 0xfff;
         /*atomic_increment_exit_reason(56);*/
 	atomic_inc(&exit_reason_arr[56]);
 	/* APIC-write VM exit is trap-like and thus no need to adjust IP */
 	kvm_apic_write_nodecode(vcpu, offset);
+	atomic_exit_time_cal(56, begin_cycle);
 	return 1;
 }
 
 static int handle_task_switch(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	unsigned long exit_qualification;
 	bool has_error_code = false;
@@ -5199,13 +5358,17 @@ static int handle_task_switch(struct kvm_vcpu *vcpu)
 	 * TODO: What about debug traps on tss switch?
 	 *       Are we supposed to inject them and update dr6?
 	 */
-	return kvm_task_switch(vcpu, tss_selector,
+	return_value = kvm_task_switch(vcpu, tss_selector,
 			       type == INTR_TYPE_SOFT_INTR ? idt_index : -1,
 			       reason, has_error_code, error_code);
+	atomic_exit_time_cal(9, begin_cycle);
+	return return_value;
 }
 
 static int handle_ept_violation(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	unsigned long exit_qualification;
 	gpa_t gpa;
 	u64 error_code;
@@ -5246,11 +5409,15 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	       PFERR_GUEST_FINAL_MASK : PFERR_GUEST_PAGE_MASK;
 
 	vcpu->arch.exit_qualification = exit_qualification;
-	return kvm_mmu_page_fault(vcpu, gpa, error_code, NULL, 0);
+	return_value = kvm_mmu_page_fault(vcpu, gpa, error_code, NULL, 0);
+	atomic_exit_time_cal(48, begin_cycle);
+	return return_value;
 }
 
 static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	gpa_t gpa;
         /*atomic_increment_exit_reason(49);*/
 	atomic_inc(&exit_reason_arr[49]);
@@ -5262,21 +5429,27 @@ static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
 	if (!is_guest_mode(vcpu) &&
 	    !kvm_io_bus_write(vcpu, KVM_FAST_MMIO_BUS, gpa, 0, NULL)) {
 		trace_kvm_fast_mmio(gpa);
-		return kvm_skip_emulated_instruction(vcpu);
+		return_value = kvm_skip_emulated_instruction(vcpu);
+		atomic_exit_time_cal(49, begin_cycle);
+		return return_value;
 	}
 
-	return kvm_mmu_page_fault(vcpu, gpa, PFERR_RSVD_MASK, NULL, 0);
+	return_value = kvm_mmu_page_fault(vcpu, gpa, PFERR_RSVD_MASK, NULL, 0);
+	atomic_exit_time_cal(49, begin_cycle);
+	return return_value;
 }
 
 static int handle_nmi_window(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(8);*/
 	atomic_inc(&exit_reason_arr[8]);
 	WARN_ON_ONCE(!enable_vnmi);
 	exec_controls_clearbit(to_vmx(vcpu), CPU_BASED_VIRTUAL_NMI_PENDING);
 	++vcpu->stat.nmi_window_exits;
 	kvm_make_request(KVM_REQ_EVENT, vcpu);
-
+	atomic_exit_time_cal(8, begin_cycle);
 	return 1;
 }
 
@@ -5404,6 +5577,8 @@ static void vmx_enable_tdp(void)
  */
 static int handle_pause(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(40);*/
 	atomic_inc(&exit_reason_arr[40]);
 	if (!kvm_pause_in_guest(vcpu->kvm))
@@ -5416,7 +5591,9 @@ static int handle_pause(struct kvm_vcpu *vcpu)
 	 * so the vcpu must be CPL=0 if it gets a PAUSE exit.
 	 */
 	kvm_vcpu_on_spin(vcpu, true);
-	return kvm_skip_emulated_instruction(vcpu);
+	return_value = kvm_skip_emulated_instruction(vcpu);
+	atomic_exit_time_cal(40, begin_cycle);
+	return return_value;
 }
 
 static int handle_nop(struct kvm_vcpu *vcpu)
@@ -5426,35 +5603,62 @@ static int handle_nop(struct kvm_vcpu *vcpu)
 
 static int handle_mwait(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         /*atomic_increment_exit_reason(36);*/
 	atomic_inc(&exit_reason_arr[36]);
 	printk_once(KERN_WARNING "kvm: MWAIT instruction emulated as NOP!\n");
-	return handle_nop(vcpu);
+	return_value = handle_nop(vcpu);
+	atomic_exit_time_cal(36, begin_cycle);
+	return return_value;
 }
 
 static int handle_invalid_op(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	u32 exit_reason = vmx->exit_reason;
 	kvm_queue_exception(vcpu, UD_VECTOR);
+	if(exit_reason == EXIT_REASON_RDRAND)
+	{
+		atomic_exit_time_cal(57, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_RDSEED)
+	{
+		atomic_exit_time_cal(61, begin_cycle);
+		return 1;
+	}
 	return 1;
 }
 
 static int handle_monitor_trap(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         //atomic_increment_exit_reason(37);
 	atomic_inc(&exit_reason_arr[37]);
+	atomic_exit_time_cal(37, begin_cycle);
 	return 1;
 }
 
 static int handle_monitor(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
         //atomic_increment_exit_reason(39);
 	atomic_inc(&exit_reason_arr[39]);
 	printk_once(KERN_WARNING "kvm: MONITOR instruction emulated as NOP!\n");
-	return handle_nop(vcpu);
+	return_value = handle_nop(vcpu);
+	atomic_exit_time_cal(39, begin_cycle);
+	return return_value;
 }
 
 static int handle_invpcid(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	u32 vmx_instruction_info;
 	unsigned long type;
 	bool pcid_enabled;
@@ -5470,6 +5674,7 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 	atomic_inc(&exit_reason_arr[58]);
 	if (!guest_cpuid_has(vcpu, X86_FEATURE_INVPCID)) {
 		kvm_queue_exception(vcpu, UD_VECTOR);
+		atomic_exit_time_cal(58, begin_cycle);
 		return 1;
 	}
 
@@ -5478,6 +5683,7 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 
 	if (type > 3) {
 		kvm_inject_gp(vcpu, 0);
+		atomic_exit_time_cal(58, begin_cycle);
 		return 1;
 	}
 
@@ -5487,15 +5693,20 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 	if (get_vmx_mem_address(vcpu, vmcs_readl(EXIT_QUALIFICATION),
 				vmx_instruction_info, false,
 				sizeof(operand), &gva))
+	{	
+		atomic_exit_time_cal(58, begin_cycle);
 		return 1;
+	}
 
 	if (kvm_read_guest_virt(vcpu, gva, &operand, sizeof(operand), &e)) {
 		kvm_inject_page_fault(vcpu, &e);
+		atomic_exit_time_cal(58, begin_cycle);
 		return 1;
 	}
 
 	if (operand.pcid >> 12 != 0) {
 		kvm_inject_gp(vcpu, 0);
+		atomic_exit_time_cal(58, begin_cycle);
 		return 1;
 	}
 
@@ -5506,14 +5717,18 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 		if ((!pcid_enabled && (operand.pcid != 0)) ||
 		    is_noncanonical_address(operand.gla, vcpu)) {
 			kvm_inject_gp(vcpu, 0);
+			atomic_exit_time_cal(58, begin_cycle);
 			return 1;
 		}
 		kvm_mmu_invpcid_gva(vcpu, operand.gla, operand.pcid);
-		return kvm_skip_emulated_instruction(vcpu);
+		return_value = kvm_skip_emulated_instruction(vcpu);
+		atomic_exit_time_cal(58, begin_cycle);
+		return return_value;
 
 	case INVPCID_TYPE_SINGLE_CTXT:
 		if (!pcid_enabled && (operand.pcid != 0)) {
 			kvm_inject_gp(vcpu, 0);
+			atomic_exit_time_cal(58, begin_cycle);
 			return 1;
 		}
 
@@ -5534,7 +5749,9 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 		 * resync will happen anyway before switching to any other CR3.
 		 */
 
-		return kvm_skip_emulated_instruction(vcpu);
+		return_value = kvm_skip_emulated_instruction(vcpu);
+		atomic_exit_time_cal(58, begin_cycle);
+		return return_value;
 
 	case INVPCID_TYPE_ALL_NON_GLOBAL:
 		/*
@@ -5547,7 +5764,9 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 		/* fall-through */
 	case INVPCID_TYPE_ALL_INCL_GLOBAL:
 		kvm_mmu_unload(vcpu);
-		return kvm_skip_emulated_instruction(vcpu);
+		return_value = kvm_skip_emulated_instruction(vcpu);
+		atomic_exit_time_cal(58, begin_cycle);
+		return return_value;
 
 	default:
 		BUG(); /* We have already checked above that type <= 3 */
@@ -5556,6 +5775,7 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 
 static int handle_pml_full(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
 	unsigned long exit_qualification;
 
 	trace_kvm_pml_full(vcpu->vcpu_id);
@@ -5578,18 +5798,20 @@ static int handle_pml_full(struct kvm_vcpu *vcpu)
 	 * PML buffer already flushed at beginning of VMEXIT. Nothing to do
 	 * here.., and there's no userspace involvement needed for PML.
 	 */
+	atomic_exit_time_cal(62, begin_cycle);
 	return 1;
 }
 
 static int handle_preemption_timer(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
         //atomic_increment_exit_reason(52);
 	atomic_inc(&exit_reason_arr[52]);
 	if (!vmx->req_immediate_exit &&
 	    !unlikely(vmx->loaded_vmcs->hv_timer_soft_disabled))
 		kvm_lapic_expired_hv_timer(vcpu);
-
+	atomic_exit_time_cal(52, begin_cycle);
 	return 1;
 }
 
@@ -5599,12 +5821,78 @@ static int handle_preemption_timer(struct kvm_vcpu *vcpu)
  */
 static int handle_vmx_instruction(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	u32 exit_reason = vmx->exit_reason;
 	kvm_queue_exception(vcpu, UD_VECTOR);
+	if (exit_reason == EXIT_REASON_VMCLEAR)
+	{
+		atomic_exit_time_cal(19, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMLAUNCH)
+	{
+		atomic_exit_time_cal(20, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMPTRLD)
+	{
+		atomic_exit_time_cal(21, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMPTRST)
+	{
+		atomic_exit_time_cal(22, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMREAD)
+	{
+		atomic_exit_time_cal(23, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMRESUME)
+	{
+		atomic_exit_time_cal(24, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMWRITE)
+	{
+		atomic_exit_time_cal(25, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMOFF)
+	{
+		atomic_exit_time_cal(26, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMON)
+	{
+		atomic_exit_time_cal(27, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_INVEPT)
+	{
+		atomic_exit_time_cal(50, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_INVVPID)
+	{
+		atomic_exit_time_cal(53, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_VMFUNC)
+	{
+		atomic_exit_time_cal(59, begin_cycle);
+		return 1;
+	}
+
 	return 1;
 }
 
 static int handle_encls(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	int return_value;
 	/*
 	 * SGX virtualization is not yet supported.  There is no software
 	 * enable bit for SGX, so we have to trap ENCLS and inject a #UD
@@ -5613,14 +5901,38 @@ static int handle_encls(struct kvm_vcpu *vcpu)
        // atomic_increment_exit_reason(60);
 	atomic_inc(&exit_reason_arr[60]);
 	kvm_queue_exception(vcpu, UD_VECTOR);
+	atomic_exit_time_cal(60, begin_cycle);
 	return 1;
 }
 
 static int handle_unexpected_vmexit(struct kvm_vcpu *vcpu)
 {
+	u64 begin_cycle = rdtsc();
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	u32 exit_reason = vmx->exit_reason;
 	kvm_skip_emulated_instruction(vcpu);
 	WARN_ONCE(1, "Unexpected VM-Exit Reason = 0x%x",
 		vmcs_read32(VM_EXIT_REASON));
+	if(exit_reason == EXIT_REASON_XSAVES)
+	{
+		atomic_exit_time_cal(63, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_XRSTORS)
+	{
+		atomic_exit_time_cal(64, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_UMWAIT)
+	{
+		atomic_exit_time_cal(67, begin_cycle);
+		return 1;
+	}
+	else if(exit_reason == EXIT_REASON_TPAUSE)
+	{
+		atomic_exit_time_cal(68, begin_cycle);
+		return 1;
+	}
 	return 1;
 }
 
@@ -5934,6 +6246,8 @@ void dump_vmcs(void)
 static int vmx_handle_exit(struct kvm_vcpu *vcpu)
 {
 	u64 s_cycle = rdtsc();
+	u64 begin_cycle = rdtsc();
+	int return_value;
 
 	/*mutex_lock(&mutex_count);
 	exit_count++; 
@@ -6046,12 +6360,22 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
 	/* If guest state is invalid, start emulating */
 	if (vmx->emulation_required){
 	net_exit_time += (rdtsc() - s_cycle);	
-	return handle_invalid_guest_state(vcpu);
+	return_value = handle_invalid_guest_state(vcpu);
+	u64 end_cycle = rdtsc();
+	u64 total_cycles = atomic_long_read(&total_exit_time);
+	total_cycles = total_cycles + (end_cycle - begin_cycle);
+	atomic_long_set(&total_exit_time, total_cycles);
+	return return_value;
 	}
 		
 	if (is_guest_mode(vcpu) && nested_vmx_exit_reflected(vcpu, exit_reason)){
 	net_exit_time += (rdtsc() - s_cycle);	
-	return nested_vmx_reflect_vmexit(vcpu, exit_reason);
+	return_value = nested_vmx_reflect_vmexit(vcpu, exit_reason);
+	u64 end_cycle = rdtsc();
+	u64 total_cycles = atomic_long_read(&total_exit_time);
+	total_cycles = total_cycles + (end_cycle - begin_cycle);
+	atomic_long_set(&total_exit_time, total_cycles);
+	return return_value;
 	}
 		
 
@@ -6060,7 +6384,11 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
 		vcpu->run->exit_reason = KVM_EXIT_FAIL_ENTRY;
 		vcpu->run->fail_entry.hardware_entry_failure_reason
 			= exit_reason;
-		net_exit_time += (rdtsc() - s_cycle);	
+		net_exit_time += (rdtsc() - s_cycle);
+		u64 end_cycle = rdtsc();
+		u64 total_cycles = atomic_long_read(&total_exit_time);
+		total_cycles = total_cycles + (end_cycle - begin_cycle);
+		atomic_long_set(&total_exit_time, total_cycles);
 		return 0;
 	}
 
@@ -6069,7 +6397,11 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
 		vcpu->run->exit_reason = KVM_EXIT_FAIL_ENTRY;
 		vcpu->run->fail_entry.hardware_entry_failure_reason
 			= vmcs_read32(VM_INSTRUCTION_ERROR);
-		net_exit_time += (rdtsc() - s_cycle);	
+		net_exit_time += (rdtsc() - s_cycle);
+		u64 end_cycle = rdtsc();
+		u64 total_cycles = atomic_long_read(&total_exit_time);
+		total_cycles = total_cycles + (end_cycle - begin_cycle);
+		atomic_long_set(&total_exit_time, total_cycles);	
 		return 0;
 	}
 
@@ -6097,6 +6429,10 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
 				vmcs_read64(GUEST_PHYSICAL_ADDRESS);	
 		}
 		net_exit_time += (rdtsc() - s_cycle);
+		u64 end_cycle = rdtsc();
+		u64 total_cycles = atomic_long_read(&total_exit_time);
+		total_cycles = total_cycles + (end_cycle - begin_cycle);
+		atomic_long_set(&total_exit_time, total_cycles);
 		return 0;
 	}
 
@@ -6121,7 +6457,14 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
 
 	if (exit_reason < kvm_vmx_max_exit_handlers
 	    && kvm_vmx_exit_handlers[exit_reason])
-		return kvm_vmx_exit_handlers[exit_reason](vcpu);
+	{
+		return_value = kvm_vmx_exit_handlers[exit_reason](vcpu);
+		u64 end_cycle = rdtsc();
+		u64 total_cycles = atomic_long_read(&total_exit_time);
+		total_cycles = total_cycles + (end_cycle - begin_cycle);
+		atomic_long_set(&total_exit_time, total_cycles);
+		return return_value;
+	}
 	else {
 		vcpu_unimpl(vcpu, "vmx: unexpected exit reason 0x%x\n",
 				exit_reason);
@@ -6131,6 +6474,10 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
 			KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
 		vcpu->run->internal.ndata = 1;
 		vcpu->run->internal.data[0] = exit_reason;
+		u64 end_cycle = rdtsc();
+		u64 total_cycles = atomic_long_read(&total_exit_time);
+		total_cycles = total_cycles + (end_cycle - begin_cycle);
+		atomic_long_set(&total_exit_time, total_cycles);
 		return 0;
 	}
 }
